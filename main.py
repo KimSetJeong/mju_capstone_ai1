@@ -1,16 +1,15 @@
 import os
 from dotenv import load_dotenv
-import pandas as pd
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, validator
-from typing import List, Optional
-from langchain_core.output_parsers import CommaSeparatedListOutputParser
+from pydantic import BaseModel, Field, field_validator
+from typing import List
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import CommaSeparatedListOutputParser
 from langchain.chains import LLMChain
 from enum import Enum
 from langchain_upstage import UpstageEmbeddings
 from langchain_openai import ChatOpenAI
-from pinecone import Pinecone, PodSpec
+from pinecone import Pinecone
 from langchain_pinecone import PineconeVectorStore
 
 # Load environment variables
@@ -20,10 +19,6 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 UPSTAGE_API_KEY = os.getenv('UPSTAGE_API_KEY')
 PINECONE_API_KEY = os.getenv('PINECONE_API_KEY')
-
-# Validate required environment variables
-if not all([OPENAI_API_KEY, UPSTAGE_API_KEY, PINECONE_API_KEY]):
-    raise ValueError("Required environment variables are missing. Please check your .env file.")
 
 app = FastAPI(title="Interview Q&A Service")
 
@@ -46,22 +41,69 @@ class ResumeInput(BaseModel):
     resume_items: List[str] = Field(..., min_items=3, max_items=5, description="자기소개서 항목들")
     job_type: JobType = Field(..., description="직무 타입")
 
-    @validator('resume_items')
+    @field_validator('resume_items')
     def validate_resume_items(cls, v):
         if not all(isinstance(item, str) and item.strip() for item in v):
             raise ValueError("모든 자기소개서 항목은 비어있지 않은 문자열이어야 합니다.")
         return v
 
 class InterviewQuestions(BaseModel):
-    questions: List[str]
+    questions: List[str] = Field(..., min_items=3, max_items=3)
+    
+    @field_validator('questions')
+    def validate_questions(cls, v):
+        # Ensure we have exactly 3 questions
+        if len(v) != 3:
+            raise ValueError("질문은 정확히 3개여야 합니다.")
+        
+        # Clean up each question
+        cleaned_questions = []
+        for i, question in enumerate(v, 1):
+            # Remove any existing numbering and clean up whitespace
+            q = question.strip()
+            if q[0].isdigit() and '. ' in q[:4]:
+                q = q[q.index('. ') + 2:]
+            
+            # Remove any newlines within the question
+            q = q.replace('\n', ' ').strip()
+            
+            # Add proper numbering
+            cleaned_questions.append(f"{i}. {q}")
+            
+        return cleaned_questions
 
-PROMPT_TEMPLATE = """
+def initialize_service():
+    try:
+        # Pinecone 초기화
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        
+        # Embedding 모델 초기화
+        embedding = UpstageEmbeddings(
+            model="solar-embedding-1-large",
+            api_key=UPSTAGE_API_KEY
+        )
+        
+        # Vector Store 초기화
+        database = PineconeVectorStore.from_existing_index(
+            index_name='question-final',
+            embedding=embedding
+        )
+        
+        # LLM 초기화
+        llm = ChatOpenAI(
+            api_key=OPENAI_API_KEY,
+            model_name="gpt-3.5-turbo",
+            temperature=0.7
+        )
+
+        # 프롬프트 템플릿 수정 - 쉼표로 구분된 응답 강조
+        prompt = ChatPromptTemplate.from_template("""
 다음은 사용자가 입력한 자기소개서입니다:
-
+    
 {resume}
-
+    
 지원자의 직무는 {job_type}입니다.
-
+    
 다음은 이 직무와 관련된 기존 질문들입니다:
 {filtered_results}
 
@@ -72,100 +114,82 @@ PROMPT_TEMPLATE = """
 3. 지원자의 동기나 열정을 확인할 수 있는 질문
 4. 위에 제시된 기존 질문들을 참고하되, 자기소개서의 내용에 맞게 변형하거나 새로운 질문을 만들어주세요.
 
-우리의 사전을 참고하여 필요한 경우 용어를 변경해주세요:
-사전: {dictionary}
-
-질문들을 쉼표로 구분하여 리스트 형태로 출력해주세요.
-"""
-
-class InterviewService:
-    def __init__(self, llm, database):
-        self.llm = llm
-        self.database = database
-        self.dictionary = ["회사명이 문장에 들어갈 경우 -> 회사"]
-        self.prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-        self.output_parser = CommaSeparatedListOutputParser()
-        self.chain = LLMChain(
-            llm=self.llm,
-            prompt=self.prompt,
-            output_parser=self.output_parser
-        )
-
-    def get_related_questions(self, job_type: str, resume: str) -> str:
-        search_terms = JOB_TYPE_MAPPING[job_type]
+중요: 질문 각각은 반드시 완성된 문장으로 작성해야 하며, 각 질문은 쉼표 `;` 기호로만 구분해주세요. 정확히 3개의 질문을 생성하세요.
+""")
+        # Chain 설정
+        chain = prompt | llm | CommaSeparatedListOutputParser()
         
-        all_results = []
-        for term in search_terms:
-            results = self.database.similarity_search_with_score(resume, k=50)
-            filtered_results = [
-                (doc.page_content, score) for doc, score in results
-                if f"job_type: {term}" in doc.page_content
-            ]
-            all_results.extend(filtered_results)
-        
-        sorted_results = sorted(all_results, key=lambda x: x[1])
-        top_results = [content for content, _ in sorted_results[:4]]
-        
-        if not top_results:
-            results = self.database.similarity_search_with_score(resume, k=4)
-            top_results = [doc.page_content for doc, _ in results]
-        
-        return "\n".join(top_results)
-
-    def generate_questions(self, resume_items: List[str], job_type: JobType) -> List[str]:
-        combined_resume = "\n\n".join([f"문항 {i+1}:\n{item}" for i, item in enumerate(resume_items)])
-        
-        related_questions = self.get_related_questions(job_type.value, combined_resume)
-        result = self.chain.invoke({
-            "resume": combined_resume,
-            "job_type": job_type.value,
-            "filtered_results": related_questions,
-            "dictionary": self.dictionary
-        })
-        
-        questions = [q.strip() for q in result if q.strip()]
-        return questions
-
-def initialize_service():
-    try:
-        # Pinecone 클라이언트 초기화
-        pc = Pinecone(
-            api_key=PINECONE_API_KEY
-        )
-        
-        # UpstageEmbeddings 설정
-        embedding = UpstageEmbeddings(
-            model="solar-embedding-1-large",
-            api_key=UPSTAGE_API_KEY
-        )
-        
-        # 인덱스 초기화
-        index = pc.Index('question-final')
-        
-        # Pinecone 벡터 스토어 초기화
-        database = PineconeVectorStore(
-            index=index,
-            embedding=embedding
-        )
-        
-        # ChatGPT 모델 설정
-        llm = ChatOpenAI(
-            api_key=OPENAI_API_KEY,
-            model_name="gpt-3.5-turbo",
-            temperature=0.7
-        )
-        
-        return InterviewService(llm=llm, database=database)
+        return database, chain
     except Exception as e:
         print(f"Service initialization failed: {str(e)}")
         raise
 
-interview_service = initialize_service()
+# 서비스 초기화
+database, chain = initialize_service()
+dictionary = ["회사명이 문장에 들어갈 경우 -> 회사"]
+
+def get_related_questions(job_type: str, resume_text: str) -> str:
+    try:
+        job_type_values = JOB_TYPE_MAPPING.get(job_type, [job_type])
+        filter_dict = {"job_type": {"$in": job_type_values}}
+        
+        results = database.similarity_search_with_score(
+            resume_text,
+            k=100,
+            filter=filter_dict
+        )
+        
+        filtered_results = [doc.page_content for doc, score in results][:4]
+        return "\n".join(filtered_results)
+    except Exception as e:
+        print(f"Error in getting related questions: {str(e)}")
+        return ""
+    
+# 결과 처리 - 쉼표가 아닌 `;` 구분을 기준으로 분리
+def generate_questions(resume_items: List[str], job_type: JobType) -> List[str]:
+    try:
+        # Combine resume items
+        combined_resume = "\n\n".join([f"문항 {i+1}:\n{item}" for i, item in enumerate(resume_items)])
+
+        # Get related questions
+        related_questions = get_related_questions(job_type.value, combined_resume)
+
+        # Generate new questions using chain
+        result = chain.invoke({
+            "resume": combined_resume,
+            "job_type": job_type.value,
+            "filtered_results": related_questions,
+            "dictionary": dictionary
+        })
+
+        # `result`가 리스트일 경우 요소를 결합해 문자열로 변환
+        if isinstance(result, list):
+            result = ' '.join(result)  # 리스트 요소를 하나의 문자열로 결합
+
+        # 결과에서 `;` 기준으로 분리된 질문만 가져오기
+        raw_questions = [q.strip() for q in result.split(';') if q.strip()]
+
+        # 질문이 3개 미만이면 기본 질문으로 채우기
+        while len(raw_questions) < 3:
+            raw_questions.append("자기소개서 내용에 대해 더 자세히 설명해주실 수 있습니까?")
+
+        # 번호 매기기
+        formatted_questions = [f"{q}" for i, q in enumerate(raw_questions[:3], 1)]
+
+        return formatted_questions
+        
+    except Exception as e:
+        print(f"Error in generate_questions: {str(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        raise Exception(f"Failed to generate questions: {str(e)}")
+
+
 
 @app.post("/generate-questions", response_model=InterviewQuestions)
 async def generate_interview_questions(resume_input: ResumeInput) -> InterviewQuestions:
     try:
-        questions = interview_service.generate_questions(
+        questions = generate_questions(
             resume_items=resume_input.resume_items,
             job_type=resume_input.job_type
         )
