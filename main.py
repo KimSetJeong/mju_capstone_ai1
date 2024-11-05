@@ -145,7 +145,6 @@ def get_related_questions(job_type: str, resume_text: str) -> str:
         print(f"Error in getting related questions: {str(e)}")
         return ""
     
-# 결과 처리 - 쉼표가 아닌 `;` 구분을 기준으로 분리
 def generate_questions(resume_items: List[str], job_type: JobType) -> List[str]:
     try:
         # Combine resume items
@@ -162,19 +161,43 @@ def generate_questions(resume_items: List[str], job_type: JobType) -> List[str]:
             "dictionary": dictionary
         })
 
-        # `result`가 리스트일 경우 요소를 결합해 문자열로 변환
+        # Handle both list and string results
         if isinstance(result, list):
-            result = ' '.join(result)  # 리스트 요소를 하나의 문자열로 결합
+            raw_text = ' '.join(result)
+        else:
+            raw_text = result
 
-        # 결과에서 `;` 기준으로 분리된 질문만 가져오기
-        raw_questions = [q.strip() for q in result.split(';') if q.strip()]
+        # Split by both semicolon and number patterns
+        import re
+        
+        # First, clean up any existing numbering that might be in the middle of text
+        cleaned_text = re.sub(r'\s+\d+\.\s+', '; ', raw_text)
+        
+        # Split by semicolon
+        raw_questions = [q.strip() for q in cleaned_text.split(';') if q.strip()]
+        
+        # Clean up questions:
+        # 1. Remove any remaining numbers at start
+        # 2. Remove any fragments that look like partial questions
+        cleaned_questions = []
+        for q in raw_questions:
+            # Remove leading numbers and dots
+            q = re.sub(r'^\d+\.\s*', '', q.strip())
+            
+            # Only add if it looks like a complete question (ends with punctuation or is long enough)
+            if q.endswith('?') or q.endswith('.') or len(q) > 30:
+                # Ensure it ends with a question mark if it doesn't have ending punctuation
+                if not any(q.endswith(p) for p in '.?!'):
+                    q += '?'
+                cleaned_questions.append(q)
 
-        # 질문이 3개 미만이면 기본 질문으로 채우기
-        while len(raw_questions) < 3:
-            raw_questions.append("자기소개서 내용에 대해 더 자세히 설명해주실 수 있습니까?")
+        # Ensure exactly 3 questions
+        while len(cleaned_questions) < 3:
+            cleaned_questions.append("자기소개서 내용에 대해 더 자세히 설명해주실 수 있습니까?")
+        cleaned_questions = cleaned_questions[:3]  # Truncate to 3 questions if more
 
-        # 번호 매기기
-        formatted_questions = [f"{q}" for i, q in enumerate(raw_questions[:3], 1)]
+        # Format with numbers
+        formatted_questions = [f"{i}. {q}" for i, q in enumerate(cleaned_questions, 1)]
 
         return formatted_questions
         
@@ -183,7 +206,6 @@ def generate_questions(resume_items: List[str], job_type: JobType) -> List[str]:
         import traceback
         print(f"Traceback: {traceback.format_exc()}")
         raise Exception(f"Failed to generate questions: {str(e)}")
-
 
 
 @app.post("/generate-questions", response_model=InterviewQuestions)
