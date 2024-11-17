@@ -2,15 +2,19 @@ import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
-from typing import List
+from typing import List, Optional
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import CommaSeparatedListOutputParser
 from langchain.chains import LLMChain
+import httpx
 from enum import Enum
 from langchain_upstage import UpstageEmbeddings
 from langchain_openai import ChatOpenAI
 from pinecone import Pinecone
 from langchain_pinecone import PineconeVectorStore
+import json
+from fastapi.middleware.cors import CORSMiddleware
+import asyncio  # 비동기 처리를 위한 라이브러리
 
 # Load environment variables
 load_dotenv()
@@ -19,6 +23,10 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 UPSTAGE_API_KEY = os.getenv('UPSTAGE_API_KEY')
 PINECONE_API_KEY = os.getenv('PINECONE_API_KEY')
+
+CLOVA_SECRET = os.getenv('CLOVA_SECRET')
+CLOVA_INVOKE_URL = os.getenv('CLOVA_INVOKE_URL')
+
 
 app = FastAPI(title="Interview Q&A Service")
 
@@ -207,6 +215,98 @@ def generate_questions(resume_items: List[str], job_type: JobType) -> List[str]:
         print(f"Traceback: {traceback.format_exc()}")
         raise Exception(f"Failed to generate questions: {str(e)}")
 
+#stt
+class VideoRequest(BaseModel):
+    video: str # 입력 형식: {"video": "비디오URL"}
+
+class STTResponse(BaseModel):
+    status: str # 처리 상태
+    stt_text: str # 변환된 텍스트
+    ai_analysis: Optional[dict] = None # AI 분석 결과 (선택적)
+
+class ClovaSpeechClient:
+    def __init__(self):
+        self.invoke_url = CLOVA_INVOKE_URL
+        self.secret = CLOVA_SECRET
+
+    async def transcribe_url(self, url: str) -> str:
+        request_body = {
+            'url': url,
+            'language': 'ko-KR', # 한국어 인식
+            'completion': 'sync' # 동기 방식 처리
+        }
+        
+        headers = {
+            'Accept': 'application/json;UTF-8',
+            'Content-Type': 'application/json;UTF-8',
+            'X-CLOVASPEECH-API-KEY': self.secret
+        }
+        
+        # httpx를 사용한 비동기 HTTP 요청
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                url=self.invoke_url + '/recognizer/url',
+                headers=headers,
+                json=request_body
+            )
+
+            print(f"Clova API Response: {response.text}")  # 응답 확인
+            
+            result = response.json()
+            text = result.get('text', '')
+            
+            if not text:
+                print(f"Empty text result. Full response: {result}")  # 전체 응답 확인
+                
+            return text
+
+class AIProcessor:
+    def __init__(self):
+        self.api1_endpoint = "http://43.201.48.59:8000/answer_predict"
+        self.api2_endpoint = "http://43.203.197.157:8000/combined-feedback"
+    
+    async def _call_api(self, endpoint: str, payload: dict) -> None:
+        """
+        개별 API 호출 비동기 메서드
+        """
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(url=endpoint, json=payload, timeout=30.0)
+                if response.status_code != 200:
+                    print(f"API 호출 실패: {endpoint}, 응답 코드: {response.status_code}")
+                else:
+                    print(f"API 호출 성공: {endpoint}")
+            except Exception as e:
+                print(f"API 호출 중 오류 발생: {endpoint}, 오류: {str(e)}")
+
+    async def process_text(self, text: str) -> None:
+        """
+        텍스트를 두 AI API에 병렬로 전송
+        """
+        payload = {"answer": text}
+        
+        # 두 API 호출을 병렬로 실행
+        tasks = [
+            self._call_api(self.api1_endpoint, payload),
+            self._call_api(self.api2_endpoint, payload)
+        ]
+        
+        await asyncio.gather(*tasks)  # 두 작업을 병렬로 실행
+
+                
+# FastAPI 앱 설정 (기존 app 사용)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+stt_client = ClovaSpeechClient()
+ai_processor = AIProcessor()  
+database, chain = initialize_service()
+
 
 @app.post("/generate-questions", response_model=InterviewQuestions)
 async def generate_interview_questions(resume_input: ResumeInput) -> InterviewQuestions:
@@ -222,6 +322,44 @@ async def generate_interview_questions(resume_input: ResumeInput) -> InterviewQu
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+@app.post("/process-video", response_model=STTResponse)
+async def process_video(request: VideoRequest):
+    try:
+        #  1. VideoRequest에서 video URL 추출 후 STT 처리
+        text = await stt_client.transcribe_url(request.video)
+        
+        # 2. AI 처리 - 변환된 텍스트에 대한 AI 분석 수행
+        await ai_processor.process_text(text)
+        
+        return STTResponse(
+            status="success",
+            stt_text=text        )
+    
+    except Exception as e:
+        print(f"Process Video Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/test-stt")
+async def test_stt():
+    """STT 기능 테스트를 위한 엔드포인트"""
+    test_video_url = "https://capstone-viewit.s3.ap-northeast-2.amazonaws.com/%E1%84%8F%E1%85%A2%E1%86%B8%E1%84%83%E1%85%B5+%E1%84%87%E1%85%A1%E1%86%AF%E1%84%91%E1%85%AD%E1%84%8B%E1%85%A7%E1%86%BC%E1%84%89%E1%85%A1%E1%86%BC%E1%84%90%E1%85%A6%E1%84%89%E1%85%B3%E1%84%90%E1%85%B3%E1%84%8B%E1%85%AD%E1%86%BC.mp4"
+    try:
+        # API 응답 전체를 로깅
+        text = await stt_client.transcribe_url(test_video_url)
+        print(f"STT Response: {text}")  # 응답 확인용 로그
+        
+        if not text:
+            return {
+                "status": "error",
+                "detail": "STT 변환 결과가 비어있습니다."
+            }
+            
+        return {"status": "success", "test_text": text}
+    except Exception as e:
+        print(f"STT Error: {str(e)}")  # 에러 로깅
+        return {"status": "error", "detail": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
