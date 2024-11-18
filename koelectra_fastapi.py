@@ -314,6 +314,7 @@ app.add_middleware(
 
 # 전역 변수로 예측기 초기화
 predictor = None
+latest_prediction = None
 
 @app.on_event("startup")
 async def startup_event():
@@ -329,17 +330,25 @@ async def startup_event():
 
 @app.post("/answer_predict", response_model=PredictionResponse) #예측을 수행하고 그 결과를 반환함
 async def predict_emotion(request: PredictionRequest):
+    global latest_prediction
     logger.info("새로운 예측 요청 받음")
     if not request.answer.strip():
         raise HTTPException(status_code=400, detail="Empty text provided")
     
     try:
         result = predictor.predict(request.answer)
+        latest_prediction = result
         logger.info("예측 완료")
         return result
     except Exception as e:
         logger.error(f"예측 처리 중 에러 발생: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/give_prediction", response_model=PredictionResponse)
+async def get_latest_prediction():
+    if latest_prediction is None:
+        raise HTTPException(status_code=404, detail="No prediction available")
+    return latest_prediction
 
 if __name__ == "__main__":
     print("서버 시작 중...")
