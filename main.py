@@ -230,40 +230,61 @@ class ClovaSpeechClient:
         self.secret = CLOVA_SECRET
 
     async def transcribe_url(self, url: str) -> str:
-        request_body = {
-            'url': url,
-            'language': 'ko-KR', # 한국어 인식
-            'completion': 'sync' # 동기 방식 처리
-        }
-        
-        headers = {
-            'Accept': 'application/json;UTF-8',
-            'Content-Type': 'application/json;UTF-8',
-            'X-CLOVASPEECH-API-KEY': self.secret
-        }
-        
-        # httpx를 사용한 비동기 HTTP 요청
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url=self.invoke_url + '/recognizer/url',
-                headers=headers,
-                json=request_body
-            )
+        try:
+            # 새로 추가할 부분: URL 로깅 및 유효성 검사
+            print(f"Attempting STT for URL: {url}")  # URL 로깅
+            
+            # 네트워크 요청 전 URL 유효성 검사
+            if not url or not url.startswith(('http://', 'https://')):
+                print(f"Invalid URL: {url}")
+                raise ValueError("유효하지 않은 URL입니다.")
+            
+            # 기존의 request_body 설정 부분
+            request_body = {
+                'url': url,
+                'language': 'ko-KR',
+                'completion': 'sync'
+            }
+            
+            headers = {
+                'Accept': 'application/json;UTF-8',
+                'Content-Type': 'application/json;UTF-8',
+                'X-CLOVASPEECH-API-KEY': self.secret
+            }
+            
+            # httpx를 사용한 비동기 HTTP 요청
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    url=self.invoke_url + '/recognizer/url',
+                    headers=headers,
+                    json=request_body,
+                    timeout=httpx.Timeout(300.0, connect=300.0)
+                )
 
-            print(f"Clova API Response: {response.text}")  # 응답 확인
-            
-            result = response.json()
-            text = result.get('text', '')
-            
-            if not text:
-                print(f"Empty text result. Full response: {result}")  # 전체 응답 확인
+                print(f"Clova API Response: {response.text}")  # 응답 확인
                 
-            return text
+                result = response.json()
+                text = result.get('text', '')
+                
+                if not text:
+                    print(f"Empty text result. Full response: {result}")  # 전체 응답 확인
+                    
+                return text
+        
+        # 새로 추가할 예외 처리 부분
+        except httpx.RequestError as e:
+            print(f"Network Request Error: {e}")
+            raise
+        except Exception as e:
+            print(f"Transcription Error: {str(e)}")
+            import traceback  # 추가로 traceback 임포트
+            print(f"Full Traceback: {traceback.format_exc()}")
+            raise
 
 class AIProcessor:
     def __init__(self):
-        self.api1_endpoint = "http://43.201.48.59:8000/answer_predict"
-        self.api2_endpoint = "http://43.203.197.157:8000/combined-feedback"
+        self.api1_endpoint = "http://43.203.197.157:8000/store-second-data"
+        self.api2_endpoint = "http://43.201.48.59:8000/answer_predict"
     
     async def _call_api(self, endpoint: str, payload: dict) -> None:
         """
@@ -327,8 +348,16 @@ async def health_check():
 @app.post("/process-video", response_model=STTResponse)
 async def process_video(request: VideoRequest):
     try:
+        if not request.video:
+            raise HTTPException(status_code=400, detail="비디오 URL이 제공되지 않았습니다.")
         #  1. VideoRequest에서 video URL 추출 후 STT 처리
         text = await stt_client.transcribe_url(request.video)
+
+        if not text:
+            raise HTTPException(
+                status_code=500, 
+                detail="STT 변환에 실패했습니다. 텍스트를 추출할 수 없습니다."
+            )
         
         # 2. AI 처리 - 변환된 텍스트에 대한 AI 분석 수행
         await ai_processor.process_text(text)
@@ -337,9 +366,14 @@ async def process_video(request: VideoRequest):
             status="success",
             stt_text=text        )
     
+    except httpx.RequestError as e:
+        print(f"네트워크 요청 오류: {e}")
+        raise HTTPException(status_code=500, detail=f"네트워크 요청 실패: {str(e)}")
+    
     except Exception as e:
         print(f"Process Video Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Full Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"비디오 처리 중 오류 발생: {str(e)}")
     
 @app.get("/test-stt")
 async def test_stt():
